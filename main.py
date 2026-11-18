@@ -96,8 +96,25 @@ def solve():
                     if 1 <= hour_idx <= 24:
                         curve[hour_idx] = float(h_data.get("viewers", 0))
                 
-                # Weight: exp(-abs(ln(p/pc))/0.5)
-                weight = math.exp(-abs(math.log(p / pc)) / 0.5)
+                # Weight: base size match * recency * platform match
+                base_weight = math.exp(-abs(math.log(p / pc)) / 0.5)
+                
+                # Recency factor - softened decay (0.05 instead of 0.15)
+                ref_dt = datetime(2026, 1, 1, tzinfo=timezone.utc)
+                ds_dt = day_start if day_start.tzinfo else day_start.replace(tzinfo=timezone.utc)
+                years_diff = max(0.0, (ref_dt - ds_dt).days / 365.25)
+                recency_weight = math.exp(-0.05 * years_diff)
+                
+                # Platform match factor
+                target_platforms = set(case.get("platforms", []))
+                comp_platforms = set(comp.get("platforms", []))
+                if target_platforms and comp_platforms:
+                    overlap = len(target_platforms & comp_platforms) / float(len(target_platforms | comp_platforms))
+                    platform_weight = 0.8 + 0.4 * overlap
+                else:
+                    platform_weight = 1.0
+                
+                weight = base_weight * recency_weight * platform_weight
                 valid_comparables.append({
                     "pc": pc,
                     "weight": weight,
@@ -115,25 +132,41 @@ def solve():
                     pool_ln_ratio.append(math.log(val_h / comp["pc"]))
                     weights.append(comp["weight"])
             
-            if not pool_ln_ratio:
-                # Fallback if no data for this hour
-                q_values = [p] * 5
-            else:
-                levels = [0.05, 0.25, 0.5, 0.75, 0.95]
+            levels = [0.05, 0.25, 0.5, 0.75, 0.95]
+            if pool_ln_ratio:
                 qs = [get_weighted_quantile(pool_ln_ratio, weights, q) for q in levels]
-                
-                # (4) Calibrate: multiply log-spread by 1.25, keeping median fixed
-                median_idx = 2
-                median_val = qs[median_idx]
-                calibrated_qs = []
-                for q_val in qs:
-                    diff = q_val - median_val
-                    calibrated_qs.append(median_val + diff * 1.25)
-                
-                # q_tau = p * exp(quantile)
-                q_values = [max(0.01, p * math.exp(cq)) for cq in calibrated_qs]
-                # Ensure ascending
-                q_values.sort()
+            else:
+                # With no analogues, retain a flat median but express uncertainty.
+                qs = [0.0] * 5
+
+            # For h >= 12, blend a size-weighted upper quantile into the median.
+            if len(pool_ln_ratio) >= 3 and h >= 12:
+                q65 = get_weighted_quantile(pool_ln_ratio, weights, 0.65)
+                qs[2] = 0.6 * qs[2] + 0.4 * q65
+
+            median_val = qs[2]
+            if len(pool_ln_ratio) < 3:
+                # Sparse pools often produce duplicate quantiles. Enforce a modest,
+                # horizon-growing minimum log band, including when the pool is empty.
+                inner_floor = 0.12 + 0.01 * (h - 2)
+                outer_floor = 2.0 * inner_floor
+                qs[0] = min(qs[0], median_val - outer_floor)
+                qs[1] = min(qs[1], median_val - inner_floor)
+                qs[3] = max(qs[3], median_val + inner_floor)
+                qs[4] = max(qs[4], median_val + outer_floor)
+
+            # Keep early-hour calibration modest; retain wider late-hour surge bands.
+            calibrated_qs = []
+            for idx, q_val in enumerate(qs):
+                diff = q_val - median_val
+                mult = 1.1 if h < 12 else 1.25
+                if 12 <= h <= 21 and idx in (3, 4):
+                    mult = 1.5
+                calibrated_qs.append(median_val + diff * mult)
+
+            # q_tau = p * exp(quantile), with a positive finite floor.
+            q_values = [max(0.01, p * math.exp(cq)) for cq in calibrated_qs]
+            q_values.sort()
                 
             forecast_hours.append({
                 "hour": h,
